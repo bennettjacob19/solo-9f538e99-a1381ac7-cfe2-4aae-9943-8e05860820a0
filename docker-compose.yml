@@ -1,0 +1,36 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: pg-drill-db
+    environment:
+      POSTGRES_USER: drill
+      POSTGRES_PASSWORD: drill
+      POSTGRES_DB: drill
+    ports:
+      # Published on 55432 to avoid clashing with a host PostgreSQL on 5432.
+      # The app reaches the DB over the compose network at db:5432 regardless.
+      - "55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U drill -d drill"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  app:
+    build: .
+    container_name: pg-drill-app
+    environment:
+      # psycopg DSN; exactly two long-lived connections are opened.
+      DATABASE_URL: postgresql://drill:drill@db:5432/drill
+      DB_CONNECT_TIMEOUT: "60"
+      SEED_DEPLOYMENTS: "1"
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
