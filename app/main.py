@@ -90,19 +90,22 @@ def root() -> dict:
     }
 
 
-@app.get("/health", tags=["meta"], summary="健康检查（含两条连接的 PID）")
+@app.get("/health", tags=["meta"], summary="健康检查（含两条连接的 PID 与故障状态）")
 def health() -> dict:
     conns = state.runtime.connections_state()
-    ok = all(c.get("connected") for c in conns)
+    ok = all(c.get("healthy") for c in conns)
     return {
         "status": "ok" if ok else "degraded",
         "seed_inserted": getattr(app.state, "seed_inserted", None),
         "connections": [
             {
                 "slot": c["connection_slot"],
+                "state": c["state"],
                 "connected": c["connected"],
+                "healthy": c["healthy"],
                 "backend_pid": c["backend_pid"],
                 "prepared_count": c["prepared_count"],
+                "fault_count": c["fault_count"],
             }
             for c in conns
         ],

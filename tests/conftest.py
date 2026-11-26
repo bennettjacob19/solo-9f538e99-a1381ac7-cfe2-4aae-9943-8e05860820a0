@@ -18,6 +18,8 @@ if not os.environ.get("DATABASE_URL"):
     _server = pgserver.get_server(_PG_DIR)
     os.environ["DATABASE_URL"] = _server.get_uri()
     os.environ.setdefault("DB_CONNECT_TIMEOUT", "30")
+    # The fault-recovery drill needs the HTTP fault-injection switchboard.
+    os.environ.setdefault("ENABLE_FAULT_INJECTION", "1")
     print(f"\n[conftest] embedded PostgreSQL at {_server.get_uri()}")
 
 from fastapi.testclient import TestClient  # noqa: E402
@@ -40,19 +42,27 @@ def _clean_state(client):
     # Empty batch history.
     with state.runtime.store._lock:
         state.runtime.store._items.clear()
-    # Empty both physical prepared-statement caches for cache-isolation tests.
+    # Empty both physical prepared-statement caches for cache-isolation tests,
+    # and reset the failure-handling state machine / chaos hooks.
     for slot in state.runtime.slots:
         with slot.lock:
+            slot.inject_disconnect_at = None
             try:
-                slot.ensure_conn_locked()
+                if not slot.healthy:
+                    slot.ensure_conn_locked()
                 if slot.conn is not None:
                     slot.conn.execute("DEALLOCATE ALL")
             except Exception:
                 try:
-                    slot.reconcile()
+                    slot.ensure_conn_locked()
+                    if slot.conn is not None:
+                        slot.conn.execute("DEALLOCATE ALL")
                 except Exception:
                     pass
             slot.statements.clear()
+            slot.state = "healthy"
+            slot.fault_count = 0
+            slot.faults = []
     # Defensive: a test must never leave the global batch lock held.
     if state.runtime.batch_lock.locked():
         try:

@@ -30,6 +30,10 @@ def main() -> None:
     dsn = server.get_uri()
     os.environ["DATABASE_URL"] = dsn
     os.environ.setdefault("DB_CONNECT_TIMEOUT", "30")
+    # Local one-command serve is a drill environment: expose the test-only
+    # fault-injection switchboard so demo_http.py can drive a disconnect over
+    # plain HTTP. The Docker image leaves this unset (endpoint stays 404).
+    os.environ.setdefault("ENABLE_FAULT_INJECTION", "1")
 
     host = os.environ.get("HOST", "127.0.0.1")
     port = int(os.environ.get("PORT", "8000"))

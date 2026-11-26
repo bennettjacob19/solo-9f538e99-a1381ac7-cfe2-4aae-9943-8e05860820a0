@@ -332,3 +332,241 @@ def plan_batch(
         )
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Resume planning after a confirmed mid-batch connection disconnect
+# ---------------------------------------------------------------------------
+def _simulate_resume_connection(
+    order: tuple[int, ...],
+    queries: Sequence[PlannerQuery],
+    initial_lru: Sequence[str],
+    cap: int,
+    free_at: int,
+    min_starts: dict[int, int],
+) -> _ConnResult | None:
+    """Like :func:`_simulate_connection` but for the un-executed tail of a batch.
+
+    ``order`` holds *local positions* in ``queries``; the produced light steps
+    carry the queries' original batch indices (``q.index``). ``free_at`` is the
+    tick the connection becomes available again (completed work keeps occupying
+    it), and ``min_starts[original_index]`` is the original planned start tick:
+    a resumed step may never begin earlier than it was first scheduled, in
+    addition to respecting its arrival tick and deadline.
+    """
+    lru: list[str] = list(initial_lru)
+    light: list[LightStep] = []
+    prepares = 0
+    sum_end = 0
+    conn_free = free_at
+
+    for order_idx, pos in enumerate(order):
+        q = queries[pos]
+        earliest = max(q.arrival, conn_free, min_starts.get(q.index, 0))
+        start = earliest
+        end = start + q.duration
+        inclusive = bool(q.deadline_inclusive)
+        allowed_end = q.deadline + (1 if inclusive else 0)
+        if end > allowed_end:
+            return None
+
+        hit = q.key in lru
+        evicted: str | None = None
+        if hit:
+            lru.remove(q.key)
+            lru.append(q.key)
+        else:
+            prepares += 1
+            lru.append(q.key)
+            if len(lru) > cap:
+                evicted = lru.pop(0)
+
+        light.append((q.index, order_idx, start, end, hit, 0 if hit else 1, evicted))
+        conn_free = end
+        sum_end += end
+
+    return _ConnResult(
+        light=light,
+        prepares=prepares,
+        free_at=conn_free,
+        sum_end=sum_end,
+        final_lru=lru,
+    )
+
+
+def plan_resume(
+    pending_queries: Sequence[PlannerQuery],
+    current_lrus: Sequence[Sequence[str]],
+    free_at: Sequence[int],
+    original_starts: dict[int, int],
+    remaining_prepares: int,
+    *,
+    cap: int = 2,
+    inclusive_deadline: bool = False,
+) -> PlanResult:
+    """Re-schedule the not-yet-executed tail after a confirmed disconnect.
+
+    Guarantees, per the drill's failure-handling contract:
+
+    * every resumed step keeps ``start >= original planned start`` and still
+      honors its own arrival tick and deadline;
+    * work already completed on either connection keeps occupying that
+      connection until its tick (``free_at``);
+    * only the *remaining* PREPARE budget may be spent — PREPAREs already
+      issued before the fault count against the original batch limit;
+    * a reconnected (cold) backend simply presents an empty LRU; a slot that
+      could not be reconnected presents an empty LRU too, so plans touching it
+      are naturally more expensive and are only chosen when nothing else works
+      (the runtime additionally refuses to execute on an unavailable slot).
+    """
+    n = len(pending_queries)
+    if n < 1:
+        raise ValueError("续排至少需要一个未执行查询。")
+    if n > 8:
+        raise ValueError("续排查询数不能超过 8。")
+    if remaining_prepares < 0:
+        raise ValueError("remaining_prepares 不能为负。")
+
+    resolved_qs: list[PlannerQuery] = []
+    for q in pending_queries:
+        flag = (
+            q.deadline_inclusive
+            if q.deadline_inclusive is not None
+            else inclusive_deadline
+        )
+        resolved_qs.append(
+            PlannerQuery(
+                index=q.index,
+                session=q.session,
+                name=q.name,
+                key=q.key,
+                arrival=q.arrival,
+                duration=q.duration,
+                deadline=q.deadline,
+                deadline_inclusive=bool(flag),
+            )
+        )
+    queries = resolved_qs
+    by_index = {q.index: q for q in queries}
+
+    def materialize_resume(
+        c0: _ConnResult, c1: _ConnResult
+    ) -> list[StepPlan]:
+        steps: list[StepPlan] = []
+        for conn_idx, result in ((0, c0), (1, c1)):
+            for orig_index, order_idx, start, end, hit, prep, evicted in result.light:
+                q = by_index[orig_index]
+                steps.append(
+                    StepPlan(
+                        index=orig_index,
+                        connection=conn_idx,
+                        order_on_connection=order_idx,
+                        arrival_tick=q.arrival,
+                        duration_ticks=q.duration,
+                        deadline_tick=q.deadline,
+                        start_tick=start,
+                        end_tick=end,
+                        last_busy_tick=end - 1,
+                        completion_tick=end,
+                        cache_hit=hit,
+                        prepare_count=prep,
+                        evicted_key=evicted,
+                    )
+                )
+        return steps
+
+    lru0 = list(current_lrus[0]) if len(current_lrus) > 0 else []
+    lru1 = list(current_lrus[1]) if len(current_lrus) > 1 else []
+    free0 = int(free_at[0]) if len(free_at) > 0 else 0
+    free1 = int(free_at[1]) if len(free_at) > 1 else 0
+
+    best_rank: tuple | None = None
+    best_c0: _ConnResult | None = None
+    best_c1: _ConnResult | None = None
+    dl_rank: tuple | None = None
+    dl_c0: _ConnResult | None = None
+    dl_c1: _ConnResult | None = None
+
+    for mask in range(1 << n):
+        group0 = tuple(i for i in range(n) if ((mask >> i) & 1) == 0)
+        group1 = tuple(i for i in range(n) if ((mask >> i) & 1) == 1)
+
+        for perm0 in permutations(group0):
+            r0 = _simulate_resume_connection(
+                perm0, queries, lru0, cap, free0, original_starts
+            )
+            if r0 is None:
+                continue
+            for perm1 in permutations(group1):
+                r1 = _simulate_resume_connection(
+                    perm1, queries, lru1, cap, free1, original_starts
+                )
+                if r1 is None:
+                    continue
+
+                rank = (
+                    r0.prepares + r1.prepares,
+                    max(r0.free_at, r1.free_at),
+                    r0.sum_end + r1.sum_end,
+                    mask,
+                    tuple(step[0] for step in r0.light),
+                    tuple(step[0] for step in r1.light),
+                )
+
+                if dl_rank is None or rank < dl_rank:
+                    dl_rank, dl_c0, dl_c1 = rank, r0, r1
+                if rank[0] <= remaining_prepares and (
+                    best_rank is None or rank < best_rank
+                ):
+                    best_rank, best_c0, best_c1 = rank, r0, r1
+
+    cache_before = [lru0, lru1]
+
+    if best_c0 is not None and best_c1 is not None and best_rank is not None:
+        steps = materialize_resume(best_c0, best_c1)
+        return PlanResult(
+            feasible=True,
+            steps=steps,
+            total_prepares=best_rank[0],
+            planned_prepares=best_rank[0],
+            makespan_ticks=best_rank[1],
+            max_prepares=remaining_prepares,
+            cache_before=cache_before,
+            cache_after=[best_c0.final_lru, best_c1.final_lru],
+        )
+
+    result = PlanResult(
+        feasible=False,
+        max_prepares=remaining_prepares,
+        cache_before=cache_before,
+    )
+    if dl_rank is not None:
+        min_prepares = dl_rank[0]
+        result.minimum_prepares_among_deadline_feasible = min_prepares
+        diag_steps = sorted(
+            materialize_resume(dl_c0, dl_c1),  # type: ignore[arg-type]
+            key=lambda s: (s.start_tick, s.connection, s.index),
+        )
+        result.best_deadline_feasible = {
+            "total_prepares": min_prepares,
+            "makespan_ticks": dl_rank[1],
+            "within_prepare_limit": min_prepares <= remaining_prepares,
+            "steps": [s.to_dict() for s in diag_steps],
+            "cache_after_lru": [
+                dl_c0.final_lru if dl_c0 else [],  # type: ignore[union-attr]
+                dl_c1.final_lru if dl_c1 else [],  # type: ignore[union-attr]
+            ],
+        }
+        result.reason = "resume_prepare_budget_exceeded"
+        result.message = (
+            f"断线续排：存在守住原到达拍/截止拍与原定起拍的排程，但尾部至少还需 "
+            f"{min_prepares} 次 PREPARE，超过剩余上限 {remaining_prepares}；"
+            "本批停止，未执行项保留，幸存槽缓存不变。"
+        )
+    else:
+        result.reason = "resume_deadline_infeasible"
+        result.message = (
+            "断线续排：在不早于原定起拍、不突破原到达拍/截止拍且不覆盖两槽已占时段的"
+            "前提下，不存在可行续排；本批停止，未执行项保留，幸存槽缓存不变。"
+        )
+    return result

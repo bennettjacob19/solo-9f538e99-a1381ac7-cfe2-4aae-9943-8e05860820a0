@@ -28,6 +28,13 @@ class Settings:
     # How long startup waits for PostgreSQL (docker compose first boot).
     db_connect_timeout_seconds: float = float(os.getenv("DB_CONNECT_TIMEOUT", "60"))
     seed_deployments: bool = os.getenv("SEED_DEPLOYMENTS", "1") not in ("0", "false", "False")
+    # Test/chaos switchboard for the disconnect-recovery drill. Disabled by
+    # default (and in the Docker image); enabled explicitly for local serve /
+    # the embedded test server so /docs-driven recovery tests can inject a
+    # fault over plain HTTP without touching process internals.
+    enable_fault_injection: bool = os.getenv(
+        "ENABLE_FAULT_INJECTION", "0"
+    ) in ("1", "true", "True")
 
 
 def get_settings() -> Settings:

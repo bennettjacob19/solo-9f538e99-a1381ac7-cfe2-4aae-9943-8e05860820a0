@@ -151,10 +151,14 @@ curl -X POST http://localhost:8000/api/batches \
   - `deadline_infeasible`：即使 PREPARE 不限量，时限也不可能满足。
   - 拒绝发生在任何真实 `PREPARE` **之前**，只做 `pg_prepared_statements` 只读核对，
     因此 **原缓存照旧**（有测试逐字比对）。
-- **执行出错**：HTTP **500**，`status=error`，返回 PostgreSQL `sqlstate` 与错误；
-  本批立即停止，排程中位于失败步之后的查询标记为 `skipped`；随后对 **两条**
-  连接查询 `pg_prepared_statements` 做核对，以连接上仍真实存在的预备语句为准
-  重建缓存元数据。
+- **执行出错（SQL 被 PostgreSQL 受理并返回错误）**：HTTP **500**，`status=error`、
+  `error_reason=sql_error`，返回 PostgreSQL `sqlstate` 与错误；本批立即停止，排程中
+  位于失败步之后的查询标记为 `skipped`；随后对 **两条** 连接查询
+  `pg_prepared_statements` 做核对，以连接上仍真实存在的预备语句为准重建缓存元数据。
+  **SQL 已发出后报错绝不重连、绝不重跑该查询。**
+- **执行中连接断线（连接本身不可用，而非 SQL 错误）**：见下节 4.6，触发
+  「一次确认重连 + 精确续排」恢复流程；有解则本批继续并最终 `completed`，无解则
+  HTTP **500** 报错、逐项列出未执行查询并保留幸存槽缓存。
 - **已有批次在跑**：HTTP **409** `batch_busy`（进程级 `threading.Lock`
   非阻塞获取，保证一次只跑一批）。
 - `POST /api/batches/plan`：只排程试算，不执行、不发 `PREPARE`、不动缓存。
@@ -216,6 +220,67 @@ $$\sum_{k=0}^{n}\binom{n}{k}k!(n-k)!=(n+1)n!\le 9\cdot 40320=362\,880$$
 > 「真实 PREPARE 次数」「每连接两条」「按名核对 `pg_prepared_statements`」
 > 都完全可见、可控、可测。
 
+### 4.2b 取数中途断线：一次确认重连 + 精确续排（`app/runtime.py`、`app/planner.py`）
+
+报表取到一半某条 PostgreSQL 连接断开是本演练的核心故障场景。修复前的隐患是：
+断线后旧的预备语句缓存元数据仍被当作「命中」，而静默重连得到的新后端缓存其实为空，
+于是**超发 `PREPARE`**、且可能重跑已经取过的查询。现在的状态机与契约如下。
+
+**连接槽三态**（`ConnectionSlot.state`）：
+
+| 状态 | 含义 | 是否可用于取数/借槽 |
+| --- | --- | --- |
+| `healthy` | 后端存活，缓存元数据与真实后端一致 | 是 |
+| `faulted` | 检测到断线、尚未恢复；元数据已清空 | 否 |
+| `reconnected` | 一次确认重连成功，新后端存活但缓存为空（冷） | 是（冷缓存） |
+
+断线与 SQL 错误被明确区分（`is_disconnect_error`）：只有
+`OperationalError/InterfaceError`、`08xxx` sqlstate 或连接/套接字类报文才判为断线；
+普通 SQL 错误（如 `42P01` 缺表）说明语句已送达并被 PostgreSQL 回答，**连接保持健康、
+绝不重连、绝不重跑**，仍按 4.2 的「立即停批 + 核对」处理。
+
+**恢复流程（每批至多一次确认重连）**：
+
+1. 在某一步 `run_step` 抛出断线异常时，该槽置 `faulted`，记录故障事件（含
+   `previous_backend_pid`），批次在故障步暂停；**已完成查询的结果、后端 PID、起止拍
+   原样保留，查询不重跑**。
+2. 对故障槽做**且仅做一次**确认重连；成功则进入 `reconnected`，记录
+   `new_backend_pid`（新后端缓存为空是事实）。重连本身失败 → 直接报错停批，
+   `error_reason=reconnect_failed`，逐项列出未执行查询，幸存槽缓存原样保留。
+3. 对其余**幸存的健康槽**先按 `pg_prepared_statements` 核对真实预备语句，确保后续
+   「命中/未命中」判断不会再超发 `PREPARE`。
+4. 用纯函数 `plan_resume` 对**未执行尾部**做精确枚举续排，硬性约束：
+   - 每个续跑步 `start ≥ 原计划 start`（不早于原定起拍），同时仍满足各自
+     **原到达拍**与**原截止拍**；
+   - 两槽上已完成工作仍占用连接到对应拍（`free_at`），续排不得覆盖**两槽已占时段**；
+   - 可把尾部**改派幸存槽**（命中其真实缓存则 0 次 PREPARE），或在补开的**冷槽**上
+     重新 PREPARE；
+   - 故障前**已发的 PREPARE 计入原批次限额**，续排只能花「剩余预算」
+     （`remaining_prepare_budget = max_prepares − 已发次数`），因此总 PREPARE 永不超限。
+5. 续排有解 → 在真实 PG 上跑完尾部，批次最终 `status=completed`，响应里每个查询带
+   `phase=initial|resumed`、实际后端 PID、起止拍与 PREPARE 次数，顶层给出完整
+   `recovery` 与 `resume_plan`。
+6. 续排无解 → HTTP **500**，`error_reason=resume_infeasible`
+   （`resume_prepare_budget_exceeded` 或 `resume_deadline_infeasible`），
+   `error.unexecuted_queries` 逐项标明未执行查询及其到达/截止拍，幸存槽缓存保留。
+7. 续跑期间若**再次**断线（任一槽），按「每批最多一次确认重连」立即停批，
+   `error_reason=second_disconnect_aborts`，不再发起第二次重连。
+
+**故障期间的只读端点（绝不补连）**：
+
+- `GET /api/deployments`：通过 `borrow_idle_healthy_slot` 只借**空闲且健康**的槽查
+  部署表；两槽都被占用或无健康槽时返回 HTTP **503** `slots_busy`，**查数不补连**。
+- `POST /api/cache/reconcile`：只对健康槽查真实 `pg_prepared_statements`；故障槽标记为
+  `暂不可核对`（响应里的 `note` 与 `unverifiable_slots`），**接口不补连**。
+- `GET /health`、`GET /api/connections`、`GET /api/cache` 如实汇报每槽 `state`、
+  `healthy`、`backend_pid` 与 `fault_count`。
+
+**测试用故障注入开关**：为在 `/docs`/HTTP 层面复现断线，提供
+`POST /api/testing/faults/disconnect?connection=&query_index=` 与
+`DELETE /api/testing/faults`。该开关由环境变量 `ENABLE_FAULT_INJECTION` 控制，
+**默认关闭、Docker 镜像不设置（端点返回 404）**；仅本地 `serve_local.py` 与 pytest
+显式开启。另有测试钩子可对真实后端执行 `pg_terminate_backend` 验证非模拟的断线检测。
+
 ### 4.3 绑定快照（`app/bindings.py`、`app/routes.py`）
 
 - `BindingStore` 是线程安全的内存存储，键 `(session,name)`，保存规范化 SQL、
@@ -248,6 +313,7 @@ GET      /api/batches , /api/batches/{id}
 GET      /api/cache , POST /api/cache/reconcile
 GET      /api/connections
 GET      /api/deployments?service=&version=&date=
+POST     /api/testing/faults/disconnect , DELETE /api/testing/faults  (测试开关，默认关)
 GET      /health , /docs , /openapi.json
 ```
 
@@ -263,18 +329,28 @@ Pydantic 2.14.4 / uvicorn 0.54.0；测试与本地演练通过 `pgserver 0.1.4`
 
 ```text
 $ pytest -q
-29 passed, 2 warnings in 1.90s
+49 passed, 2 warnings in 2.66s
 ```
 
-- `tests/test_planner.py`（10）：冷缓存 0 限额、最小 PREPARE 数、热缓存 0 限额、
+- `tests/test_planner.py`（16）：冷缓存 0 限额、最小 PREPARE 数、热缓存 0 限额、
   物理时限不可行、PREPARE 换并行保 deadline、到达拍、截止拍边界（含 inclusive）、
-  LRU 淘汰导致重新 PREPARE、跨批 LRU、8 查询穷举性能。
+  LRU 淘汰导致重新 PREPARE、跨批 LRU、8 查询穷举性能；**新增 6 个 `plan_resume`
+  续排单测**：原定起拍下界、两槽已占时段、改派幸存冷/热槽、剩余 PREPARE 预算耗尽、
+  续排时限不可行、到达拍仍生效。
 - `tests/test_api_e2e.py`（19）：`/docs`/OpenAPI/health、种子数据三种筛选、
   同名跨会话独立、改绑版本与旧 SQL、三种占位符与标量/对象/数组参数、
   缺失绑定 404、真实 PID/起止拍/结果、双连接并行、**受理快照抗改绑**、
   **限额拒绝且缓存逐字不变**、限额受理后 0 限额全命中、
   **每连接容量 2 的跨批 LRU 淘汰**、**执行出错停止 + sqlstate + 核对恢复**、
   超 8 条 422、**持锁时 409**、试算不动缓存、信封与根别名。
+- `tests/test_fault_recovery_e2e.py`（14，新增）：断线后**一次确认重连 + 精确续跑**、
+  已完成查询不重跑且保留原 PID/起止拍、续跑守住原到达/截止/原定起拍、
+  **PREPARE 不超原限额**、改派幸存槽零额外 PREPARE、**预算耗尽无解且标明未执行项、
+  幸存缓存保留**、**重连失败即停批**、**续跑二次断线即停（不第二次重连）**、
+  **真实 `pg_terminate_backend` 杀后端的检测与恢复**、故障期
+  `/api/deployments` 借空闲健康槽（借不到 503、不补连）、
+  `/api/cache/reconcile` 不补连且故障槽标暂不可核对、注入开关关闭时 404、
+  恢复后继续服务、正常/故障批次交错的状态一致性。
 
 ### 5.2 同名改绑 + 限额批次真机演练
 
@@ -313,9 +389,35 @@ $ python scripts/demo_http.py
   [PASS] batch stops: one error, later schedule steps skipped ...
   [PASS] reconcile endpoint ok and cap respected
   [PASS] service still takes a good batch after the error
+
+=== 8. mid-batch disconnect: one reconnect, then exact resume ===
+  [PASS] resume scenario is schedulable
+  [PASS] fault injection armed over HTTP
+  [PASS] batch still completes after a confirmed disconnect
+  [PASS] exactly one confirmed reconnect happened
+  [PASS] reconnect reports old -> new backend PID
+  [PASS] finished queries keep their initial phase (never re-run)
+  [PASS] faulting query runs in the resumed phase
+  [PASS] resumed tick honors original start/deadline
+  [PASS] PREPAREs never exceed the original budget
+    #0 fx/svc pg-conn-1 pid=1519 ticks=0->2 prepare=1 ...
+    #4 fx/svc pg-conn-1 pid=1673 ticks=3->4 prepare=1 ...   # 新后端 PID，冷槽重 PREPARE
+  [PASS] reconcile after recovery never reconnects
+  [PASS] service serves normal batches after recovery
 ...
-DEMO EXIT=0，33 项 [PASS]，0 失败
+DEMO EXIT=0，44 项 [PASS]，0 失败
 ```
+
+### 5.3 断线恢复的关键真机证据
+
+- 故障槽旧后端 `pid=1519` 在查询 #4 前断开；一次确认重连后新后端 `pid=1673`，
+  #0–#3 保留原 PID 与起止拍、`phase=initial` 不重跑，仅 #4 以 `phase=resumed`
+  在新后端按原起拍下界（tick 3）续跑到 tick 4，未突破截止拍。
+- 续排只花剩余 PREPARE 预算；改派到幸存热槽时尾部可做到 0 次额外 PREPARE
+  （见 `test_resume_can_reassign_tail_to_surviving_slot_with_zero_extra_prepare`）。
+- 故障期 `GET /api/deployments` 走幸存健康槽正常返回；把幸存槽也占住后返回
+  **503 `slots_busy`** 且不新建连接；`POST /api/cache/reconcile` 对故障槽给出
+  `暂不可核对` 标注、`reconnect_attempted=false`。
 
 另外验证了镜像启动命令本身：带 `DATABASE_URL` 直接执行 Dockerfile 的 CMD
 `uvicorn app.main:app --host 0.0.0.0 --port 8000` 可正常启动、`/health=ok`。
@@ -332,15 +434,15 @@ app/
   bindings.py    # 线程安全的 (session,name) 绑定存储与快照
   templates.py   # 6 个按服务/版本/日期筛选的内置参数化 SQL
   sqlnorm.py     # $1 / :name / %(name)s -> 规范 $n，hash 与单语句校验
-  planner.py     # 双连接 + LRU(2) 的精确枚举排程器（纯函数）
-  runtime.py     # 2 条 psycopg 连接、真实 PREPARE/EXECUTE、出错核对
+  planner.py     # 双连接 + LRU(2) 精确枚举；plan_batch 受理 + plan_resume 断线续排（纯函数）
+  runtime.py     # 2 条连接、真实 PREPARE/EXECUTE、故障三态机、一次重连+续排、出错核对
   seed.py        # deployments 建表 + 84 条内置部署记录
   store.py       # 内存批次记录
-  config.py      # 环境变量配置
-tests/           # 29 个 pytest（planner 单测 + 真实 PG 的 HTTP E2E）
+  config.py      # 环境变量配置（含 ENABLE_FAULT_INJECTION 测试开关）
+tests/           # 49 个 pytest（planner/续排单测 + 真实 PG 的 HTTP E2E + 故障恢复 E2E）
 scripts/
-  serve_local.py # pgserver + uvicorn 本地一键
-  demo_http.py   # 同名改绑 / 限额 / 权衡 / 出错恢复 实测脚本（仅标准库）
+  serve_local.py # pgserver + uvicorn 本地一键（开启故障注入开关）
+  demo_http.py   # 同名改绑 / 限额 / 权衡 / 出错恢复 / 断线续排 实测脚本（仅标准库）
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt
@@ -350,12 +452,12 @@ requirements.txt / requirements-dev.txt
 
 ## 7. 缺项与边界（如实说明）
 
-1. **Docker 在本沙箱未实跑**：当前环境没有 `docker`/`dockerd` 也没有 sudo，
-   因此 `docker compose up --build` 未能在这里真正执行；已做的验证是
-   compose YAML 解析通过、配置按 v2 规范编写，并用等价的
-   `uvicorn app.main:app` 命令实跑验证。镜像首次构建（pip 安装）未在本机实测，
-   但锁定版本均为本机已从 PyPI 实际安装的版本，`psycopg[binary]` 提供
-   slim/x86_64/arm64 预编译 wheel。
+1. **docker compose 在本沙箱未实跑**：当前环境没有 `docker`/`dockerd` 也没有 sudo，
+   因此 `docker compose up --build` 未能在这里真正执行；已做的验证是 compose YAML
+   解析通过、配置按 v2 规范编写，并用 `pgserver` 拉起的真实 PostgreSQL 16 跑通
+   全部 49 项 pytest 与 44 项 HTTP 演练，以及等价的 `uvicorn app.main:app` 启动、
+   `/health=ok`。镜像首次构建（pip 安装）未在本机实测，但锁定版本均为本机已从
+   PyPI 实际安装的版本，`psycopg[binary]` 提供 slim/x86_64/arm64 预编译 wheel。
 2. **「拍」是逻辑模拟时间**：不会按拍真实 sleep，真实取数耗时也不反馈回排程；
    排程保证的是给定 `duration_ticks` 模型下的时限可行性。
 3. **真实执行按全局拍序串行发起**：两条连接是不同物理后端/PID，独占与顺序约束
@@ -368,6 +470,9 @@ requirements.txt / requirements-dev.txt
    鉴权。生产化建议使用只读 DB 角色，并以 `EXPLAIN`/解析器禁止
    INSERT/UPDATE/DELETE/DDL 与数据修改型 CTE。
 6. **排程器为精确枚举，上限 8**：超过 8 个查询需要换 DP/约束求解；接口层已强制
-   `max_length=8`。
-7. 没有配 CI workflow，也没有用真实浏览器点 Swagger UI（仅验证 `/docs` 200 与
+   `max_length=8`。续排 `plan_resume` 同样只处理 ≤8 的未执行尾部。
+7. **故障恢复的边界**：每批只承诺「一次确认重连」，续跑期再次断线即停批；恢复只覆盖
+   单条连接断线这一确定场景，不处理数据库整体宕机/网络分区等需要人工介入的灾难。
+   故障注入是测试能力，`ENABLE_FAULT_INJECTION` 默认关闭、Docker 镜像不开启。
+8. 没有配 CI workflow，也没有用真实浏览器点 Swagger UI（仅验证 `/docs` 200 与
    OpenAPI 内容）。

@@ -126,3 +126,104 @@ def test_eight_queries_enumerates_quickly():
     assert r.feasible
     assert r.total_prepares == 8
     assert elapsed < 10.0  # generous upper bound even on slow CI
+
+
+# ---------------------------------------------------------------------------
+# Resume planning after a confirmed mid-batch disconnect
+# ---------------------------------------------------------------------------
+from app.planner import plan_resume  # noqa: E402
+
+
+def test_resume_keeps_original_start_as_lower_bound():
+    # Two pending queries originally scheduled at ticks 3 and 3; even with an
+    # idle connection and arrival 0 they must not start earlier than 3.
+    qs = [q(0, key="A", arrival=0, duration=1, deadline=5),
+          q(1, key="B", arrival=0, duration=1, deadline=6)]
+    r = plan_resume(
+        qs,
+        current_lrus=[[], []],
+        free_at=[0, 0],
+        original_starts={0: 3, 1: 3},
+        remaining_prepares=2,
+    )
+    assert r.feasible
+    for step in r.steps:
+        assert step.start_tick >= 3
+
+
+def test_resume_respects_occupied_ticks_of_completed_work():
+    # Connection 0 is occupied until tick 4 by already-finished work.
+    qs = [q(0, key="A", duration=2, deadline=8)]
+    r = plan_resume(
+        qs,
+        current_lrus=[["A"], []],
+        free_at=[4, 0],
+        original_starts={0: 4},
+        remaining_prepares=0,
+    )
+    assert r.feasible
+    step = r.steps[0]
+    # Cache hit only exists on conn 0, so it must wait there until tick 4.
+    assert step.connection == 0
+    assert step.start_tick == 4 and step.end_tick == 6
+    assert step.cache_hit and step.prepare_count == 0
+
+
+def test_resume_can_move_work_to_surviving_cold_slot():
+    # Faulted slot 0 reconnects cold; slot 1 already caches A. Zero extra
+    # PREPARE is possible only by moving the pending A query onto slot 1.
+    qs = [q(0, key="A", duration=1, deadline=5)]
+    r = plan_resume(
+        qs,
+        current_lrus=[[], ["A"]],
+        free_at=[2, 2],
+        original_starts={0: 2},
+        remaining_prepares=0,
+    )
+    assert r.feasible
+    assert r.steps[0].connection == 1
+    assert r.steps[0].cache_hit
+    assert r.total_prepares == 0
+
+
+def test_resume_budget_exhausted_is_infeasible_with_diagnostic():
+    # Cold caches need 1 PREPARE but the remaining budget is 0.
+    qs = [q(0, key="A", duration=1, deadline=5)]
+    r = plan_resume(
+        qs,
+        current_lrus=[[], []],
+        free_at=[0, 0],
+        original_starts={0: 0},
+        remaining_prepares=0,
+    )
+    assert r.feasible is False
+    assert r.reason == "resume_prepare_budget_exceeded"
+    assert r.minimum_prepares_among_deadline_feasible == 1
+
+
+def test_resume_deadline_impossible_after_fault():
+    # Original start lower bound 4 plus duration 2 ends at 6 > deadline 5.
+    qs = [q(0, key="A", duration=2, deadline=5)]
+    r = plan_resume(
+        qs,
+        current_lrus=[["A"], []],
+        free_at=[0, 0],
+        original_starts={0: 4},
+        remaining_prepares=0,
+    )
+    assert r.feasible is False
+    assert r.reason == "resume_deadline_infeasible"
+    assert r.best_deadline_feasible is None
+
+
+def test_resume_arrival_tick_still_guarded():
+    qs = [q(0, key="A", arrival=5, duration=1, deadline=6)]
+    r = plan_resume(
+        qs,
+        current_lrus=[["A"], []],
+        free_at=[0, 0],
+        original_starts={0: 0},
+        remaining_prepares=0,
+    )
+    assert r.feasible
+    assert r.steps[0].start_tick == 5

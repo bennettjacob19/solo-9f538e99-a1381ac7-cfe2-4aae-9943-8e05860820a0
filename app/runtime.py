@@ -1,4 +1,21 @@
-"""Two physical PostgreSQL connections + real PREPARE/EXECUTE execution."""
+"""Two physical PostgreSQL connections + real PREPARE/EXECUTE execution.
+
+Failure model implemented here (see README §4.6):
+
+* A mid-batch **connection disconnect** is detected explicitly instead of
+  being silently healed by ``ensure_conn_locked``. The slot moves to the
+  ``faulted`` state and the batch pauses at the faulting step.
+* Exactly one **confirmed** recovery reconnect is attempted for the faulted
+  slot. The new backend starts with an empty prepared-statement set — that is
+  ground truth, so the stale cache metadata is dropped and the un-executed
+  tail is re-scheduled with :func:`app.planner.plan_resume` against the real
+  surviving caches, the remaining PREPARE budget and every original
+  arrival/deadline/start-tick constraint.
+* SQL errors (the statement was delivered and PostgreSQL answered) still stop
+  the batch immediately — a reconnect must never re-run an unknown query.
+* Read-only side endpoints (:func:`app.routes` deployments / reconcile) never
+  trigger a reconnect; they borrow an idle healthy slot or report busy.
+"""
 from __future__ import annotations
 
 import datetime as dt
@@ -11,11 +28,24 @@ from decimal import Decimal
 from typing import Any
 
 import psycopg
+from psycopg import errors as pg_errors
 from psycopg import sql as psql
 
-from .planner import PlanResult, PlannerQuery, StepPlan, plan_batch
+from .planner import PlanResult, PlannerQuery, StepPlan, plan_batch, plan_resume
 from .seed import seed_if_empty
 from .store import BatchStore
+
+# Slot lifecycle states.
+STATE_HEALTHY = "healthy"
+STATE_FAULTED = "faulted"          # backend gone; not yet recovered
+STATE_RECONNECTED = "reconnected"  # one confirmed recovery reconnect done
+
+# Batch error reasons (surfaced in records and HTTP 500 bodies).
+REASON_SQL_ERROR = "sql_error"
+REASON_DISCONNECT = "connection_disconnect"
+REASON_RECONNECT_FAILED = "reconnect_failed"
+REASON_RESUME_INFEASIBLE = "resume_infeasible"
+REASON_SECOND_DISCONNECT = "second_disconnect_aborts"
 
 
 class BatchBusy(RuntimeError):
@@ -98,6 +128,44 @@ def json_safe(value: Any) -> Any:
     return str(value)
 
 
+def is_disconnect_error(exc: BaseException) -> bool:
+    """True only when the connection itself is unusable.
+
+    A regular SQL error (undefined table, bad types ...) means PostgreSQL
+    received the statement and answered it — the connection stays healthy and
+    the query must never be retried on a new backend.
+    """
+    if isinstance(
+        exc,
+        (
+            pg_errors.OperationalError,
+            pg_errors.InterfaceError,
+            ConnectionError,
+            EOFError,
+            BrokenPipeError,
+        ),
+    ):
+        return True
+    # psycopg marks a dead backend with .sqlstate 08000/08003/08006 ...
+    sqlstate = getattr(exc, "sqlstate", None)
+    if isinstance(sqlstate, str) and sqlstate.startswith("08"):
+        return True
+    message = str(exc).lower()
+    needles = (
+        "connection",
+        "server closed",
+        "terminat",
+        "broken pipe",
+        "eof",
+        "socket",
+        "not connected",
+        "already closed",
+        "could not receive",
+        "could not send",
+    )
+    return any(needle in message for needle in needles)
+
+
 class ConnectionSlot:
     """One long-lived PG backend and its LRU of prepared statements (<= cap)."""
 
@@ -110,6 +178,35 @@ class ConnectionSlot:
         # key -> entry; iteration order is LRU (oldest first).
         self.statements: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self.lock = threading.RLock()
+        # Failure-handling state machine.
+        self.state: str = STATE_HEALTHY
+        self.fault_count: int = 0
+        self.faults: list[dict[str, Any]] = []
+        # Test/chaos hook: when set, the next run_step matching this query
+        # index raises a synthetic disconnect before any SQL is sent.
+        self.inject_disconnect_at: int | None = None
+
+    @property
+    def slot_name(self) -> str:
+        return f"pg-conn-{self.index + 1}"
+
+    @property
+    def healthy(self) -> bool:
+        """Healthy and currently usable. Never performs I/O / reconnects.
+
+        A ``reconnected`` slot is fully usable: the single confirmed recovery
+        reconnect succeeded and its (cold) backend is live. Only ``faulted``
+        or closed slots are unhealthy.
+        """
+        if self.state == STATE_FAULTED:
+            return False
+        conn = self.conn
+        if conn is None:
+            return False
+        try:
+            return not bool(getattr(conn, "closed", False))
+        except Exception:
+            return False
 
     # ---- connection management ---------------------------------------
     def connect_locked(self) -> None:
@@ -123,8 +220,14 @@ class ConnectionSlot:
         self.conn = conn
         self.pid = conn.info.backend_pid
         self.statements.clear()
+        self.state = STATE_HEALTHY
 
     def ensure_conn_locked(self) -> None:
+        """Connect (or reconnect) on demand.
+
+        Only used by lifecycle/startup paths and explicit recovery; normal
+        read endpoints must call :meth:`healthy` first and never reconnect.
+        """
         dead = self.conn is None
         if self.conn is not None:
             try:
@@ -147,74 +250,154 @@ class ConnectionSlot:
                 except Exception:
                     pass
             self.conn = None
+            self.pid = None
+
+    # ---- failure handling ---------------------------------------------
+    def mark_faulted_locked(self, *, reason: str, detail: str) -> dict[str, Any]:
+        """Record that this backend is gone. Stale metadata is preserved until
+        the recovery decision (reconnected backends start cold anyway)."""
+        old_pid = self.pid
+        event = {
+            "at": dt.datetime.now().isoformat(timespec="seconds"),
+            "connection": self.index,
+            "connection_slot": self.slot_name,
+            "previous_backend_pid": old_pid,
+            "reason": reason,
+            "detail": detail[:300],
+        }
+        try:
+            if self.conn is not None:
+                self.conn.close()
+        except Exception:
+            pass
+        self.conn = None
+        self.pid = None
+        # The new backend (if any) will have an empty prepared set; dropping
+        # the metadata now makes the cold-cache fact explicit everywhere.
+        self.statements.clear()
+        self.state = STATE_FAULTED
+        self.fault_count += 1
+        self.faults.append(event)
+        return dict(event)
+
+    def attempt_recovery_reconnect_locked(self, previous_pid: int | None = None) -> dict[str, Any]:
+        """The single confirmed recovery reconnect for this fault episode."""
+        event = {
+            "at": dt.datetime.now().isoformat(timespec="seconds"),
+            "connection": self.index,
+            "connection_slot": self.slot_name,
+            "previous_backend_pid": previous_pid if previous_pid is not None else self.pid,
+        }
+        self.connect_locked()  # sets state=healthy, pid, clears statements
+        self.state = STATE_RECONNECTED
+        event["new_backend_pid"] = self.pid
+        event["outcome"] = "reconnected"
+        event["prepared_statements_after"] = 0
+        return event
+
+    def clear_injection(self) -> None:
+        with self.lock:
+            self.inject_disconnect_at = None
 
     # ---- cache introspection / reconciliation -------------------------
     def lru_keys(self) -> list[str]:
         with self.lock:
             return list(self.statements.keys())
 
-    def reconcile(self) -> dict[str, Any]:
-        """Make our metadata match pg_prepared_statements exactly."""
-        with self.lock:
+    def probe_prepared_locked(self) -> list[tuple[str, str | None]]:
+        """Read pg_prepared_statements on a currently-healthy slot only."""
+        if not self.healthy:
+            raise RuntimeError("slot_not_healthy")
+        assert self.conn is not None
+        rows = self.conn.execute(
+            "SELECT name, statement FROM pg_prepared_statements "
+            "WHERE left(name, 3) = 'rq_'"
+        ).fetchall()
+        return [(name, statement) for name, statement in rows]
+
+    def reconcile_locked(self, *, allow_reconnect: bool) -> dict[str, Any]:
+        """Make metadata match pg_prepared_statements exactly.
+
+        ``allow_reconnect=False`` (the public endpoint during a fault) never
+        opens a new connection: a faulted slot is reported as temporarily
+        unverifiable and its metadata is left for the batch recovery flow.
+        """
+        if not allow_reconnect and not self.healthy:
+            return self.describe_locked(
+                reconciled=True,
+                connection_reset=False,
+                note="故障槽暂不可核对：本接口不补连，等待批次恢复流程处理。",
+            )
+
+        try:
+            self.ensure_conn_locked()
+            assert self.conn is not None
+            rows = self.conn.execute(
+                "SELECT name, statement FROM pg_prepared_statements "
+                "WHERE left(name, 3) = 'rq_'"
+            ).fetchall()
+        except Exception:
+            # Backend unusable: a reconnect gives an empty prepared-statement
+            # set, which is the ground truth for the new backend.
+            try:
+                if self.conn is not None:
+                    self.conn.close()
+            except Exception:
+                pass
+            self.conn = None
+            self.pid = None
+            self.statements.clear()
             try:
                 self.ensure_conn_locked()
-                assert self.conn is not None
-                rows = self.conn.execute(
-                    "SELECT name, statement FROM pg_prepared_statements "
-                    "WHERE left(name, 3) = 'rq_'"
-                ).fetchall()
             except Exception:
-                # Backend unusable: a reconnect gives an empty prepared-statement
-                # set, which is the ground truth for the new backend.
-                try:
-                    if self.conn is not None:
-                        self.conn.close()
-                except Exception:
-                    pass
-                self.conn = None
-                self.pid = None
-                self.statements.clear()
-                try:
-                    self.ensure_conn_locked()
-                except Exception:
-                    pass
-                return self.describe_locked(reconciled=True, connection_reset=True)
+                pass
+            return self.describe_locked(reconciled=True, connection_reset=True)
 
-            valid: dict[str, str | None] = {name: statement for name, statement in rows}
+        valid: dict[str, str | None] = {name: statement for name, statement in rows}
 
-            for key in list(self.statements.keys()):
-                entry = self.statements[key]
-                if entry["statement_name"] not in valid:
-                    self.statements.pop(key, None)
+        for key in list(self.statements.keys()):
+            entry = self.statements[key]
+            if entry["statement_name"] not in valid:
+                self.statements.pop(key, None)
 
-            known_names = {e["statement_name"] for e in self.statements.values()}
-            for name, statement_text in valid.items():
-                if name in known_names:
-                    continue
-                key = name[3:] if name.startswith("rq_") else name
-                recovered_sql = None
-                if statement_text:
-                    marker = " AS "
-                    pos = statement_text.upper().find(marker)
-                    if pos != -1:
-                        recovered_sql = statement_text[pos + len(marker) :]
-                self.statements[key] = {
-                    "key": key,
-                    "statement_name": name,
-                    "sql": recovered_sql,
-                    "source": "postgresql_reconciled",
-                    "session": None,
-                    "query_name": None,
-                }
-                self.statements.move_to_end(key)
+        known_names = {e["statement_name"] for e in self.statements.values()}
+        for name, statement_text in valid.items():
+            if name in known_names:
+                continue
+            key = name[3:] if name.startswith("rq_") else name
+            recovered_sql = None
+            if statement_text:
+                marker = " AS "
+                pos = statement_text.upper().find(marker)
+                if pos != -1:
+                    recovered_sql = statement_text[pos + len(marker) :]
+            self.statements[key] = {
+                "key": key,
+                "statement_name": name,
+                "sql": recovered_sql,
+                "source": "postgresql_reconciled",
+                "session": None,
+                "query_name": None,
+            }
+            self.statements.move_to_end(key)
 
-            return self.describe_locked(reconciled=True, connection_reset=False)
+        return self.describe_locked(reconciled=True, connection_reset=False)
+
+    def reconcile(self, *, allow_reconnect: bool = True) -> dict[str, Any]:
+        with self.lock:
+            return self.reconcile_locked(allow_reconnect=allow_reconnect)
 
     def describe(self) -> dict[str, Any]:
         with self.lock:
             return self.describe_locked(reconciled=False, connection_reset=False)
 
-    def describe_locked(self, *, reconciled: bool, connection_reset: bool) -> dict[str, Any]:
+    def describe_locked(
+        self,
+        *,
+        reconciled: bool,
+        connection_reset: bool,
+        note: str | None = None,
+    ) -> dict[str, Any]:
         stmts = []
         total = len(self.statements)
         for pos, (key, entry) in enumerate(self.statements.items()):
@@ -230,22 +413,35 @@ class ConnectionSlot:
                     "most_recently_used": pos == total - 1,
                 }
             )
-        connected = self.conn is not None and not bool(getattr(self.conn, "closed", False))
+        connected = self.healthy
         return {
             "connection": self.index,
-            "connection_slot": f"pg-conn-{self.index + 1}",
+            "connection_slot": self.slot_name,
+            "state": self.state,
             "connected": connected,
+            "healthy": connected,
             "backend_pid": self.pid if connected else None,
             "prepared_count": total,
             "max_prepared": self.cap,
             "reconciled": reconciled,
             "connection_reset": connection_reset,
+            "fault_count": self.fault_count,
+            "note": note,
             "statements": stmts,
         }
 
     # ---- real execution ----------------------------------------------
     def run_step(self, step: StepPlan, rq: ResolvedQuery) -> dict[str, Any]:
         with self.lock:
+            # Chaos/test injection: simulate the backend dying immediately
+            # before this step would have touched it.
+            if self.inject_disconnect_at == rq.index:
+                self.inject_disconnect_at = None
+                raise pg_errors.OperationalError(
+                    "server closed the connection unexpectedly "
+                    "(injected disconnect for failure-recovery drill)"
+                )
+
             self.ensure_conn_locked()
             assert self.conn is not None
             pid = self.conn.info.backend_pid
@@ -310,6 +506,16 @@ class ConnectionSlot:
             }
 
 
+class _StepFailure(Exception):
+    """Internal control-flow signal for a failed execution step."""
+
+    def __init__(self, index: int, error: dict[str, Any], *, disconnect: bool):
+        self.index = index
+        self.error = error
+        self.disconnect = disconnect
+        super().__init__(error.get("message", "step failed"))
+
+
 class BatchRuntime:
     def __init__(self, dsn: str, *, connection_count: int = 2, cap: int = 2) -> None:
         self.dsn = dsn
@@ -343,7 +549,8 @@ class BatchRuntime:
             if seed:
                 inserted = seed_if_empty(conn)
         for slot in self.slots:
-            slot.connect_locked()
+            with slot.lock:
+                slot.connect_locked()
         return inserted
 
     def shutdown(self) -> None:
@@ -356,8 +563,26 @@ class BatchRuntime:
     def connections_state(self) -> list[dict[str, Any]]:
         return [slot.describe() for slot in self.slots]
 
-    def reconcile_all(self) -> list[dict[str, Any]]:
-        return [slot.reconcile() for slot in self.slots]
+    def reconcile_all(self, *, allow_reconnect: bool = True) -> list[dict[str, Any]]:
+        return [slot.reconcile(allow_reconnect=allow_reconnect) for slot in self.slots]
+
+    # ---- read-only slot borrowing (never reconnects) ------------------
+    def borrow_idle_healthy_slot(self) -> ConnectionSlot:
+        """Pick an idle, healthy slot for a side read endpoint.
+
+        Raises :class:`NoHealthySlot` when no slot can serve the read without
+        waiting (faulted backend, or every healthy slot is mid-batch). This
+        method never opens a connection.
+        """
+        for slot in self.slots:
+            if not slot.healthy:
+                continue
+            if slot.lock.acquire(blocking=False):
+                # Re-check under the lock: state may have changed meanwhile.
+                if slot.healthy:
+                    return slot
+                slot.lock.release()
+        raise NoHealthySlot("当前没有空闲且健康的连接槽可借用（故障或批次占用中）。")
 
     # ---- batch submission --------------------------------------------
     def submit_batch(
@@ -401,10 +626,13 @@ class BatchRuntime:
             "snapshot": [rq.snapshot_dict() for rq in resolved],
             "request": request_echo,
             "plan": None,
+            "resume_plan": None,
+            "recovery": None,
             "queries": [],
             "cache_before": None,
             "cache_after": None,
             "error": None,
+            "error_reason": None,
         }
         results: list[dict[str, Any] | None] = [None] * len(resolved)
 
@@ -477,51 +705,35 @@ class BatchRuntime:
                 plan.steps, key=lambda s: (s.start_tick, s.connection, s.index)
             )
 
-            for step in ordered_steps:
-                rq = resolved[step.index]
-                base: dict[str, Any] = {
-                    "query_index": rq.index,
-                    "session": rq.session,
-                    "query_name": rq.name,
-                    "binding_version_at_acceptance": rq.binding_version,
-                    "connection": step.connection,
-                    "connection_slot": f"pg-conn-{step.connection + 1}",
-                    "start_tick": step.start_tick,
-                    "end_tick": step.end_tick,
-                    "completion_tick": step.completion_tick,
-                    "last_busy_tick": step.last_busy_tick,
-                    "arrival_tick": step.arrival_tick,
-                    "duration_ticks": step.duration_ticks,
-                    "deadline_tick": step.deadline_tick,
-                    "cache_hit": step.cache_hit,
-                    "prepare_count": step.prepare_count,
-                    "planned_evicted_key": step.evicted_key,
-                    "params": rq.positional_params,
-                }
-                try:
-                    executed = self.slots[step.connection].run_step(step, rq)
-                except Exception as exc:  # noqa: BLE001 - stop batch, report
-                    err = {
-                        "type": type(exc).__name__,
-                        "message": str(exc).strip(),
-                        "sqlstate": getattr(exc, "sqlstate", None),
-                        "failed_query_index": rq.index,
-                        "session": rq.session,
-                        "query_name": rq.name,
-                        "statement_name": rq.statement_name,
-                    }
-                    base.update(
-                        {
-                            "status": "error",
-                            "error": err,
-                            "backend_pid": self.slots[step.connection].pid,
-                        }
-                    )
-                    results[rq.index] = base
-                    raise _BatchStepFailure(rq.index, err) from exc
-
-                base.update(executed)
-                results[rq.index] = base
+            try:
+                self._execute_steps(
+                    ordered_steps=ordered_steps,
+                    resolved=resolved,
+                    results=results,
+                    record=record,
+                    plan=plan,
+                    max_prepares=max_prepares,
+                    inclusive_deadline=inclusive_deadline,
+                )
+            except _StepFailure as failure:
+                if not failure.disconnect:
+                    self._finalize_sql_error(record, results, resolved, failure)
+                    raise BatchExecutionError(record) from failure.__cause__
+                # Disconnect: the recovery flow either finishes the tail or
+                # finalizes the record as an error itself.
+                self._handle_disconnect(
+                    failure=failure,
+                    record=record,
+                    results=results,
+                    resolved=resolved,
+                    plan=plan,
+                    max_prepares=max_prepares,
+                    inclusive_deadline=inclusive_deadline,
+                )
+                if record["status"] != "running":
+                    # Recovery aborted (reconnect failure / no feasible resume
+                    # / second disconnect): the record is already finalized.
+                    raise BatchExecutionError(record)
 
             record["queries"] = results
             record["actual_prepares"] = sum(
@@ -533,37 +745,6 @@ class BatchRuntime:
             self.store.update(record)
             return record
 
-        except _BatchStepFailure as failure:
-            # Stop the whole batch; align results to the original query order
-            # and mark everything that never ran as skipped.
-            aligned: list[dict[str, Any]] = []
-            for i, item in enumerate(results):
-                if item is not None:
-                    aligned.append(item)
-                    continue
-                rq = resolved[i]
-                aligned.append(
-                    {
-                        "query_index": i,
-                        "session": rq.session,
-                        "query_name": rq.name,
-                        "status": "skipped",
-                        "error": (
-                            f"本批在查询 #{failure.index} 执行出错后停止，该查询未执行。"
-                        ),
-                    }
-                )
-            record["queries"] = aligned
-            record["actual_prepares"] = sum(
-                int(r.get("prepare_count") or 0) for r in aligned
-            )
-            record["status"] = "error"
-            record["accepted"] = True
-            record["error"] = failure.error
-            record["finished_at"] = dt.datetime.now().isoformat(timespec="seconds")
-            record["cache_after"] = self.reconcile_all()
-            self.store.update(record)
-            raise BatchExecutionError(record) from failure.__cause__
         finally:
             self.active_batch_id = None
             try:
@@ -571,9 +752,406 @@ class BatchRuntime:
             except RuntimeError:
                 pass
 
+    # ---- execution helpers --------------------------------------------
+    def _step_base(self, step: StepPlan, rq: ResolvedQuery) -> dict[str, Any]:
+        return {
+            "query_index": rq.index,
+            "session": rq.session,
+            "query_name": rq.name,
+            "binding_version_at_acceptance": rq.binding_version,
+            "connection": step.connection,
+            "connection_slot": f"pg-conn-{step.connection + 1}",
+            "start_tick": step.start_tick,
+            "end_tick": step.end_tick,
+            "completion_tick": step.completion_tick,
+            "last_busy_tick": step.last_busy_tick,
+            "arrival_tick": step.arrival_tick,
+            "duration_tick": step.duration_ticks,
+            "deadline_tick": step.deadline_tick,
+            "cache_hit": step.cache_hit,
+            "prepare_count": step.prepare_count,
+            "planned_evicted_key": step.evicted_key,
+            "params": rq.positional_params,
+        }
 
-class _BatchStepFailure(Exception):
-    def __init__(self, index: int, error: dict[str, Any]):
-        self.index = index
-        self.error = error
-        super().__init__(error.get("message", "step failed"))
+    def _execute_steps(
+        self,
+        *,
+        ordered_steps: list[StepPlan],
+        resolved: list[ResolvedQuery],
+        results: list[dict[str, Any] | None],
+        record: dict[str, Any],
+        plan: PlanResult,
+        max_prepares: int,
+        inclusive_deadline: bool,
+        phase: str = "initial",
+    ) -> None:
+        """Run steps in global tick order; raise _StepFailure on any error."""
+        for step in ordered_steps:
+            rq = resolved[step.index]
+            base = self._step_base(step, rq)
+            base["phase"] = phase
+            try:
+                executed = self.slots[step.connection].run_step(step, rq)
+            except Exception as exc:  # noqa: BLE001 - classify and stop/resume
+                disconnect = is_disconnect_error(exc)
+                slot = self.slots[step.connection]
+                err = {
+                    "type": type(exc).__name__,
+                    "message": str(exc).strip(),
+                    "sqlstate": getattr(exc, "sqlstate", None),
+                    "failed_query_index": rq.index,
+                    "session": rq.session,
+                    "query_name": rq.name,
+                    "statement_name": rq.statement_name,
+                    "connection": step.connection,
+                    "connection_slot": slot.slot_name,
+                    "disconnect": disconnect,
+                }
+                if disconnect:
+                    with slot.lock:
+                        fault_event = slot.mark_faulted_locked(
+                            reason=REASON_DISCONNECT,
+                            detail=err["message"] or type(exc).__name__,
+                        )
+                    err["fault_event"] = fault_event
+                    base.update(
+                        {
+                            "status": "interrupted",
+                            "error": err,
+                            "backend_pid": fault_event["previous_backend_pid"],
+                        }
+                    )
+                    results[rq.index] = base
+                else:
+                    base.update(
+                        {
+                            "status": "error",
+                            "error": err,
+                            "backend_pid": slot.pid,
+                        }
+                    )
+                    results[rq.index] = base
+                raise _StepFailure(rq.index, err, disconnect=disconnect) from exc
+
+            base.update(executed)
+            results[rq.index] = base
+
+    def _finalize_sql_error(
+        self,
+        record: dict[str, Any],
+        results: list[dict[str, Any] | None],
+        resolved: list[ResolvedQuery],
+        failure: _StepFailure,
+    ) -> None:
+        """SQL errors stop the batch immediately; no reconnect, no re-run."""
+        aligned: list[dict[str, Any]] = []
+        for i, item in enumerate(results):
+            if item is not None:
+                aligned.append(item)
+                continue
+            rq = resolved[i]
+            aligned.append(
+                {
+                    "query_index": i,
+                    "session": rq.session,
+                    "query_name": rq.name,
+                    "status": "skipped",
+                    "error": (
+                        f"本批在查询 #{failure.index} 执行出错后停止，该查询未执行。"
+                    ),
+                }
+            )
+        record["queries"] = aligned
+        record["actual_prepares"] = sum(
+            int(r.get("prepare_count") or 0) for r in aligned
+        )
+        record["status"] = "error"
+        record["accepted"] = True
+        record["error_reason"] = REASON_SQL_ERROR
+        record["error"] = failure.error
+        record["finished_at"] = dt.datetime.now().isoformat(timespec="seconds")
+        record["cache_after"] = self.reconcile_all()
+        self.store.update(record)
+
+    def _handle_disconnect(
+        self,
+        *,
+        failure: _StepFailure,
+        record: dict[str, Any],
+        results: list[dict[str, Any] | None],
+        resolved: list[ResolvedQuery],
+        plan: PlanResult,
+        max_prepares: int,
+        inclusive_deadline: bool,
+    ) -> None:
+        """One confirmed reconnect, then exact re-planning of the tail."""
+        faulted_index = failure.index
+        faulted_slot = self.slots[failure.error["connection"]]
+
+        recovery: dict[str, Any] = {
+            "faulted_query_index": faulted_index,
+            "faulted_connection": faulted_slot.index,
+            "faulted_connection_slot": faulted_slot.slot_name,
+            "attempted_reconnect": False,
+            "reconnected": False,
+            "reconnect_event": None,
+            "resume": None,
+        }
+        record["recovery"] = recovery
+
+        # Already-fetched results, backend PIDs and start/end ticks stay as
+        # photographed; those queries are never re-run. Only the interrupted
+        # step and everything still pending get re-scheduled.
+        done_indices = {
+            i
+            for i, item in enumerate(results)
+            if item is not None and item.get("status") == "success"
+        }
+
+        # Single confirmed recovery reconnect for the faulted slot.
+        recovery["attempted_reconnect"] = True
+        previous_pid = failure.error.get("fault_event", {}).get("previous_backend_pid")
+        try:
+            with faulted_slot.lock:
+                reconnect_event = faulted_slot.attempt_recovery_reconnect_locked(
+                    previous_pid=previous_pid
+                )
+        except Exception as exc:  # noqa: BLE001 - reconnect itself failed
+            recovery["reconnected"] = False
+            recovery["reconnect_error"] = str(exc).strip()
+            self._abort_resume(
+                record=record,
+                results=results,
+                resolved=resolved,
+                reason=REASON_RECONNECT_FAILED,
+                message=(
+                    f"连接 {faulted_slot.slot_name} 断线且一次确认重连失败：{exc}。"
+                    "本批停止，未执行项保留，幸存槽缓存保留。"
+                ),
+                failure=failure,
+            )
+            return
+        recovery["reconnected"] = True
+        recovery["reconnect_event"] = reconnect_event
+
+        # Ground the surviving slots' metadata in their real backends before
+        # planning, so cache-hit assumptions can never over-issue PREPARE.
+        for slot in self.slots:
+            with slot.lock:
+                if slot.healthy:
+                    slot.reconcile_locked(allow_reconnect=False)
+
+        pending = [
+            rq for rq in resolved if rq.index not in done_indices
+        ]
+        # Original planned start ticks are hard lower bounds for the tail.
+        original_starts = {
+            step.index: step.start_tick for step in plan.steps
+        }
+        # Ticks already occupied on each connection keep blocking it.
+        free_at = [0, 0]
+        for step in plan.steps:
+            if step.index in done_indices:
+                free_at[step.connection] = max(free_at[step.connection], step.end_tick)
+
+        spent_prepares = sum(
+            int((item or {}).get("prepare_count") or 0) for item in results
+        )
+        remaining_prepares = max_prepares - spent_prepares
+        recovery["spent_prepares_before_fault"] = spent_prepares
+        recovery["remaining_prepare_budget"] = remaining_prepares
+        recovery["occupied_until_tick"] = list(free_at)
+
+        current_lrus = [slot.lru_keys() for slot in self.slots]
+        pending_pqueries = [
+            PlannerQuery(
+                index=rq.index,
+                session=rq.session,
+                name=rq.name,
+                key=rq.key,
+                arrival=rq.arrival,
+                duration=rq.duration,
+                deadline=rq.deadline,
+                deadline_inclusive=rq.deadline_inclusive,
+            )
+            for rq in pending
+        ]
+        resume = plan_resume(
+            pending_pqueries,
+            current_lrus,
+            free_at,
+            original_starts,
+            remaining_prepares,
+            cap=self.cap,
+            inclusive_deadline=inclusive_deadline,
+        )
+        record["resume_plan"] = resume.schedule_dict()
+        recovery["resume"] = {
+            "feasible": resume.feasible,
+            "reason": resume.reason,
+            "message": resume.message,
+            "tail_prepares_needed": resume.total_prepares,
+            "pending_query_indices": [rq.index for rq in pending],
+        }
+
+        if not resume.feasible:
+            self._abort_resume(
+                record=record,
+                results=results,
+                resolved=resolved,
+                reason=REASON_RESUME_INFEASIBLE,
+                message=(
+                    "断线已确认重连，但未执行尾部无可行续排："
+                    f"{resume.message}"
+                ),
+                failure=failure,
+                resume=resume,
+            )
+            return
+
+        # A plan may still nominally touch a slot whose reconnect failed; that
+        # path cannot happen here because the faulted slot did reconnect, but
+        # guard the invariant explicitly.
+        for step in resume.steps:
+            if not self.slots[step.connection].healthy:
+                self._abort_resume(
+                    record=record,
+                    results=results,
+                    resolved=resolved,
+                    reason=REASON_RECONNECT_FAILED,
+                    message=(
+                        f"续排需要连接槽 {step.connection}，但该槽当前不可用；"
+                        "本批停止，未执行项保留，幸存槽缓存保留。"
+                    ),
+                    failure=failure,
+                    resume=resume,
+                )
+                return
+
+        resume_steps = sorted(
+            resume.steps, key=lambda s: (s.start_tick, s.connection, s.index)
+        )
+        try:
+            self._execute_steps(
+                ordered_steps=resume_steps,
+                resolved=resolved,
+                results=results,
+                record=record,
+                plan=resume,
+                max_prepares=max_prepares,
+                inclusive_deadline=inclusive_deadline,
+                phase="resumed",
+            )
+        except _StepFailure as second:
+            if second.disconnect:
+                # A second disconnect (on either slot) ends the drill batch:
+                # no further reconnects are promised by the contract.
+                # _execute_steps already marked that slot faulted; make sure
+                # any still-healthy slot involved here is recorded too.
+                slot = self.slots[second.error["connection"]]
+                with slot.lock:
+                    if slot.state == STATE_HEALTHY:
+                        slot.mark_faulted_locked(
+                            reason=REASON_SECOND_DISCONNECT,
+                            detail=second.error.get("message", ""),
+                        )
+                    # A reconnected slot that died again is already faulted by
+                    # _execute_steps; nothing else to change here.
+                self._abort_resume(
+                    record=record,
+                    results=results,
+                    resolved=resolved,
+                    reason=REASON_SECOND_DISCONNECT,
+                    message=(
+                        "续跑期间再次发生连接断线；按约定每批最多一次确认重连，"
+                        "本批立即停止，未执行项保留，幸存槽缓存保留。"
+                    ),
+                    failure=second,
+                    resume=resume,
+                )
+                return
+            self._finalize_sql_error(record, results, resolved, second)
+            return
+
+        # Tail finished: merge recovery bookkeeping into the completed record.
+        tail_prepares = sum(
+            int((results[rq.index] or {}).get("prepare_count") or 0)
+            for rq in pending
+        )
+        recovery["tail_prepares_actual"] = tail_prepares
+        recovery["completed"] = True
+        record["status"] = "running"  # outer flow flips to "completed"
+
+    def _abort_resume(
+        self,
+        *,
+        record: dict[str, Any],
+        results: list[dict[str, Any] | None],
+        resolved: list[ResolvedQuery],
+        reason: str,
+        message: str,
+        failure: _StepFailure,
+        resume: PlanResult | None = None,
+    ) -> None:
+        """Finish the record as an error, listing every not-executed item."""
+        unexecuted: list[dict[str, Any]] = []
+        aligned: list[dict[str, Any]] = []
+        for i, item in enumerate(results):
+            if item is not None:
+                aligned.append(item)
+                if item.get("status") != "success":
+                    unexecuted.append(
+                        {
+                            "query_index": i,
+                            "session": resolved[i].session,
+                            "query_name": resolved[i].name,
+                            "arrival_tick": resolved[i].arrival,
+                            "deadline_tick": resolved[i].deadline,
+                            "status": item.get("status"),
+                        }
+                    )
+                continue
+            rq = resolved[i]
+            skipped = {
+                "query_index": i,
+                "session": rq.session,
+                "query_name": rq.name,
+                "status": "not_executed",
+                "error": "断线恢复流程未能安排该查询；本批停止，未重跑任何已完成查询。",
+            }
+            aligned.append(skipped)
+            unexecuted.append(
+                {
+                    "query_index": i,
+                    "session": rq.session,
+                    "query_name": rq.name,
+                    "arrival_tick": rq.arrival,
+                    "deadline_tick": rq.deadline,
+                    "status": "not_executed",
+                }
+            )
+
+        record["queries"] = aligned
+        record["actual_prepares"] = sum(
+            int(r.get("prepare_count") or 0) for r in aligned
+        )
+        record["status"] = "error"
+        record["accepted"] = True
+        record["error_reason"] = reason
+        record["error"] = {
+            "reason": reason,
+            "message": message,
+            "failed_query_index": failure.index,
+            "sqlstate": failure.error.get("sqlstate"),
+            "unexecuted_count": len(unexecuted),
+            "unexecuted_queries": unexecuted,
+        }
+        record["finished_at"] = dt.datetime.now().isoformat(timespec="seconds")
+        # Reconcile only surviving healthy slots; faulted slots stay marked.
+        record["cache_after"] = self.reconcile_all(allow_reconnect=False)
+        self.store.update(record)
+
+
+class NoHealthySlot(RuntimeError):
+    """No idle healthy connection is available for a side read."""

@@ -275,6 +275,74 @@ def main() -> int:
     check("GET /api/batches lists records", st == 200 and len(listing["batches"]) >= 5)
     print(f"  stored batches returned: {len(listing['batches'])}")
 
+    print("\n=== 8. mid-batch disconnect: one reconnect, then exact resume ===")
+    # Deterministic five-query scenario on two built-in template SQL keys.
+    put_binding("fx", "svc", template="deployments_by_service")
+    put_binding("fx", "ver", template="deployments_by_version")
+    fx_items = [
+        q("fx", "svc", {"service": "api-gateway"}, duration=2, deadline=2),
+        q("fx", "ver", {"version": "v2.0.1"}, duration=2, deadline=2),
+        q("fx", "ver", {"version": "v2.0.1"}, duration=1, deadline=3),
+        q("fx", "svc", {"service": "api-gateway"}, duration=1, deadline=3),
+        q("fx", "svc", {"service": "api-gateway"}, duration=1, deadline=4),
+    ]
+    st, preview = call("POST", "/api/batches/plan", {"max_prepares": 4, "queries": fx_items})
+    check("resume scenario is schedulable", st == 200 and preview["plan"]["feasible"])
+    fault_conn = next(
+        s["connection"] for s in preview["plan"]["steps"] if s["query_index"] == 4
+    )
+    st, conns = call("GET", "/api/connections")
+    old_pid = next(
+        c["backend_pid"] for c in conns["connections"] if c["connection"] == fault_conn
+    )
+
+    # Arm the disconnect over the test-only HTTP switchboard (serve_local
+    # starts with ENABLE_FAULT_INJECTION=1; the Docker image does not).
+    st, armed = call(
+        "POST",
+        f"/api/testing/faults/disconnect?connection={fault_conn}&query_index=4",
+    )
+    check("fault injection armed over HTTP", st == 200 and armed.get("armed") is True,
+          str(armed)[:200])
+    st, fx = call("POST", "/api/batches", {"max_prepares": 4, "queries": fx_items})
+    check("batch still completes after a confirmed disconnect", st == 200 and fx["status"] == "completed",
+          str(fx.get("error"))[:200])
+    if st == 200:
+        rec = fx["recovery"]
+        check("exactly one confirmed reconnect happened",
+              rec["reconnected"] is True and rec["attempted_reconnect"] is True)
+        check("reconnect reports old -> new backend PID",
+              rec["reconnect_event"]["previous_backend_pid"] == old_pid
+              and rec["reconnect_event"]["new_backend_pid"] != old_pid)
+        by_index = {x["query_index"]: x for x in fx["queries"]}
+        check("finished queries keep their initial phase (never re-run)",
+              all(by_index[i]["phase"] == "initial" and by_index[i]["status"] == "success"
+                  for i in range(4)))
+        q4 = by_index[4]
+        check("faulting query runs in the resumed phase",
+              q4["phase"] == "resumed" and q4["status"] == "success")
+        check("resumed tick honors original start/deadline",
+              q4["start_tick"] >= next(s["start_tick"] for s in fx["plan"]["steps"]
+                                       if s["query_index"] == 4)
+              and q4["end_tick"] <= 4)
+        check("PREPAREs never exceed the original budget",
+              fx["actual_prepares"] <= 4 and rec["remaining_prepare_budget"] >= 0)
+        print_query_rows(fx)
+
+    # Reconcile must not reconnect anything now (both slots are healthy again).
+    st, recon = call("POST", "/api/cache/reconcile")
+    check("reconcile after recovery never reconnects",
+          st == 200 and recon["reconnect_attempted"] is False
+          and recon["unverifiable_slots"] == [])
+
+    # A later normal batch keeps working and reuses the rebuilt cache.
+    st, after = call(
+        "POST", "/api/batches",
+        {"max_prepares": 1, "queries": [q("fx", "svc", {"service": "api-gateway"})]},
+    )
+    check("service serves normal batches after recovery", st == 200
+          and after["status"] == "completed")
+
     print("\n" + "=" * 60)
     if FAILURES:
         print(f"DEMO FINISHED WITH {len(FAILURES)} FAILED CHECKS:")

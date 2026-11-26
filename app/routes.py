@@ -164,10 +164,81 @@ def get_cache() -> dict[str, Any]:
     }
 
 
-@router.post("/cache/reconcile", summary="以 pg_prepared_statements 为准核对缓存")
+@router.post("/cache/reconcile", summary="以 pg_prepared_statements 为准核对缓存（故障槽不补连）")
 def reconcile_cache() -> dict[str, Any]:
-    conns = state.runtime.reconcile_all()
-    return {"reconciled": True, "connections": conns}
+    # During a fault episode this endpoint must not open a new connection:
+    # healthy idle slots are reconciled against their real backends while the
+    # faulted slot is reported as temporarily unverifiable.
+    conns = state.runtime.reconcile_all(allow_reconnect=False)
+    unverifiable = [c["connection_slot"] for c in conns if c.get("note")]
+    return {
+        "reconciled": True,
+        "reconnect_attempted": False,
+        "unverifiable_slots": unverifiable,
+        "connections": conns,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Fault injection switchboard (test-only; disabled unless explicitly enabled)
+# ---------------------------------------------------------------------------
+def _require_fault_injection() -> None:
+    if not state.settings.enable_fault_injection:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "fault_injection_disabled",
+                "message": (
+                    "故障注入端点默认关闭；本地演练请以 ENABLE_FAULT_INJECTION=1 "
+                    "启动服务（生产/Docker 镜像不开启）。"
+                ),
+            },
+        )
+
+
+@router.post(
+    "/testing/faults/disconnect",
+    summary="[测试用] 在指定查询执行前让某条连接断线（需 ENABLE_FAULT_INJECTION=1）",
+)
+def inject_disconnect(
+    connection: int = Query(..., ge=0, le=1, description="目标连接槽下标 0/1"),
+    query_index: int = Query(..., ge=0, le=7, description="该槽执行到哪个查询下标时断线"),
+) -> dict[str, Any]:
+    _require_fault_injection()
+    if connection >= len(state.runtime.slots):
+        raise HTTPException(status_code=422, detail={"code": "bad_connection"})
+    slot = state.runtime.slots[connection]
+    with slot.lock:
+        slot.inject_disconnect_at = query_index
+        pid = slot.pid
+    return {
+        "armed": True,
+        "connection": connection,
+        "connection_slot": slot.slot_name,
+        "current_backend_pid": pid,
+        "disconnect_before_query_index": query_index,
+        "message": (
+            f"已在 {slot.slot_name} 上埋设一次断线：执行查询 #{query_index} 前触发；"
+            "触发后该批次按『一次确认重连 + 精确续排』恢复。"
+        ),
+    }
+
+
+@router.delete(
+    "/testing/faults",
+    summary="[测试用] 清除尚未触发的断线注入（需 ENABLE_FAULT_INJECTION=1）",
+)
+def clear_faults() -> dict[str, Any]:
+    _require_fault_injection()
+    cleared = []
+    for slot in state.runtime.slots:
+        with slot.lock:
+            if slot.inject_disconnect_at is not None:
+                cleared.append(
+                    {"connection": slot.index, "query_index": slot.inject_disconnect_at}
+                )
+            slot.inject_disconnect_at = None
+    return {"cleared": cleared}
 
 
 # ---------------------------------------------------------------------------
@@ -205,15 +276,32 @@ def list_deployments(
     sql += " ORDER BY deployed_at DESC, id DESC LIMIT %s"
     params.append(limit)
 
-    slot = state.runtime.slots[0]
-    with slot.lock:
-        slot.ensure_conn_locked()
-        assert slot.conn is not None
+    # Side reads only borrow an idle *healthy* slot and never trigger a
+    # reconnect: while a batch occupies both slots (or one is faulted with no
+    # healthy spare), the API answers 503 slots_busy instead of connecting.
+    from .runtime import NoHealthySlot, json_safe
+
+    try:
+        slot = state.runtime.borrow_idle_healthy_slot()
+    except NoHealthySlot as exc:
+        faulted = [
+            s.slot_name for s in state.runtime.slots if s.state != "healthy"
+        ]
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "slots_busy",
+                "message": str(exc),
+                "faulted_slots": faulted,
+                "hint": "查询部署表不会补连；请稍后重试或等当前批次结束。",
+            },
+        ) from exc
+    try:
         cur = slot.conn.execute(sql, params)
         columns = [d.name for d in cur.description]
         rows = cur.fetchall()
-
-    from .runtime import json_safe
+    finally:
+        slot.lock.release()
 
     safe_rows = [[json_safe(v) for v in row] for row in rows]
     return {
